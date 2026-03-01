@@ -2330,6 +2330,14 @@ def _build_typescript_call_graph(
     file_list: Optional[list[str]] = None,
 ):
     """Build call graph for TypeScript files."""
+    # Initialize tsconfig resolver for path alias resolution
+    try:
+        from tldr.tsconfig_resolver import TSConfigResolver
+
+        tsconfig_resolver = TSConfigResolver(str(root))
+    except Exception:
+        tsconfig_resolver = None
+
     # Use provided file_list or scan project
     source_files = (
         file_list
@@ -2357,7 +2365,17 @@ def _build_typescript_call_graph(
                 # Convert relative path to file path with index.ts resolution
                 module_path = _resolve_ts_import(rel_path, module, str(root))
             else:
-                module_path = module
+                # Try tsconfig path alias resolution
+                resolved = None
+                if tsconfig_resolver is not None:
+                    resolved = tsconfig_resolver.resolve(module)
+                if resolved:
+                    try:
+                        module_path = str(Path(resolved).relative_to(root))
+                    except ValueError:
+                        module_path = module
+                else:
+                    module_path = module
 
             # Named imports: import { foo, bar as baz } from "./module"
             for name in imp.get("names", []):

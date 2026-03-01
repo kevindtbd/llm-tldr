@@ -538,8 +538,27 @@ class HybridExtractor:
                                             )
                                         )
                                         break
+            elif child.type in ("lexical_declaration", "variable_declaration"):
+                for vc_child in child.children:
+                    if vc_child.type == "variable_declarator":
+                        vd_name = None
+                        has_func = False
+                        for vcc in vc_child.children:
+                            if vcc.type == "identifier":
+                                vd_name = self._safe_decode(
+                                    source[vcc.start_byte : vcc.end_byte]
+                                )
+                            elif vcc.type in ("arrow_function", "function_expression"):
+                                has_func = True
+                        if vd_name and has_func:
+                            names.add(vd_name)
             # Recurse
-            if child.type in ("program", "export_statement"):
+            if child.type in (
+                "program",
+                "export_statement",
+                "lexical_declaration",
+                "variable_declaration",
+            ):
                 names.update(self._collect_ts_definitions(child, source))
         return names
 
@@ -621,6 +640,7 @@ class HybridExtractor:
                 "function_declaration",
                 "arrow_function",
                 "method_definition",
+                "function_expression",
             ):
                 func = self._extract_ts_function(child, source)
                 if func:
@@ -830,6 +850,20 @@ class HybridExtractor:
                 return_type = self._safe_decode(
                     source[child.start_byte : child.end_byte]
                 ).lstrip(": ")
+
+        if not name and node.type in ("arrow_function", "function_expression"):
+            # Walk up to variable_declarator for the name (const foo = () => {})
+            current = node.parent
+            while current:
+                if current.type == "variable_declarator":
+                    for c in current.children:
+                        if c.type == "identifier":
+                            name = self._safe_decode(
+                                source[c.start_byte : c.end_byte]
+                            )
+                            break
+                    break
+                current = current.parent
 
         if not name:
             return None
