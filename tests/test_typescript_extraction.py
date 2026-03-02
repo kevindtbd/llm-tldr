@@ -4,6 +4,9 @@ Bug 1: Object literal methods (async callbacks in configs) not extracted
 Bug 2: Nested function declarations inside components not extracted
 Bug 3: TSConfigResolver initialized with project root, misses nested tsconfig.json paths
 Bug 4: `warm` defaults to python-only, should default to all languages
+Bug 5: Module-level calls in test files not captured (describe/it callbacks)
+Bug 6: JSX component usage (<SlotCard />) not treated as call edges
+Bug 7: .tsx files parsed with typescript parser instead of tsx (JSX invisible)
 """
 
 import os
@@ -180,4 +183,107 @@ class TestWarmDefaultLanguage:
         # After fix, default should be 'all', not 'python'
         assert "(default: all)" in help_text or "default='all'" in help_text, (
             f"warm --help still shows python as default:\n{help_text}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug 5: Module-level calls in test files
+# ---------------------------------------------------------------------------
+
+class TestModuleLevelCalls:
+    """Test files have describe/it at module level, not inside functions.
+    Imported symbols used inside callbacks should create call edges."""
+
+    def _build_fixture_graph(self):
+        from tldr.cross_file_calls import _build_typescript_call_graph, ProjectCallGraph
+        from tldr.hybrid_extractor import HybridExtractor
+
+        graph = ProjectCallGraph()
+        extractor = HybridExtractor()
+
+        func_index = {}
+        ts_files = []
+        for root_dir, _dirs, files in os.walk(str(FIXTURE_DIR)):
+            for f in files:
+                if f.endswith((".ts", ".tsx")):
+                    full = os.path.join(root_dir, f)
+                    ts_files.append(full)
+                    result = extractor.extract(full)
+                    if result:
+                        rel = str(Path(full).relative_to(FIXTURE_DIR))
+                        for func in result.functions:
+                            func_index[(Path(full).stem, func.name)] = rel
+
+        _build_typescript_call_graph(
+            FIXTURE_DIR, graph, func_index, file_list=ts_files,
+        )
+        return graph
+
+    def test_test_file_has_edges(self):
+        """counter.test.tsx calls Counter() — should produce a call edge."""
+        graph = self._build_fixture_graph()
+        all_edges = list(graph.edges)
+
+        # Find edges originating from the test file
+        test_edges = [e for e in all_edges if "counter.test" in e[0]]
+        assert len(test_edges) > 0, (
+            f"No edges from counter.test.tsx. All edges: {all_edges}"
+        )
+
+    def test_test_file_calls_imported_function(self):
+        """counter.test.tsx imports Counter and calls it — edge should resolve."""
+        graph = self._build_fixture_graph()
+        all_edges = list(graph.edges)
+
+        # Should have edge from test file to Counter component
+        dst_funcs = {e[3] for e in all_edges if "counter.test" in e[0]}
+        assert "Counter" in dst_funcs, (
+            f"No edge to Counter from test file. Edges from test: "
+            f"{[e for e in all_edges if 'counter.test' in e[0]]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Bug 6: JSX component usage as call edges
+# ---------------------------------------------------------------------------
+
+class TestJSXComponentCalls:
+    """<SlotCard /> and <Counter /> in TripView.tsx should create call edges."""
+
+    def _build_fixture_graph(self):
+        from tldr.cross_file_calls import _build_typescript_call_graph, ProjectCallGraph
+        from tldr.hybrid_extractor import HybridExtractor
+
+        graph = ProjectCallGraph()
+        extractor = HybridExtractor()
+
+        func_index = {}
+        ts_files = []
+        for root_dir, _dirs, files in os.walk(str(FIXTURE_DIR)):
+            for f in files:
+                if f.endswith((".ts", ".tsx")):
+                    full = os.path.join(root_dir, f)
+                    ts_files.append(full)
+                    result = extractor.extract(full)
+                    if result:
+                        rel = str(Path(full).relative_to(FIXTURE_DIR))
+                        for func in result.functions:
+                            func_index[(Path(full).stem, func.name)] = rel
+
+        _build_typescript_call_graph(
+            FIXTURE_DIR, graph, func_index, file_list=ts_files,
+        )
+        return graph
+
+    def test_jsx_creates_call_edges(self):
+        """TripView.tsx renders <SlotCard /> and <Counter /> — should be edges."""
+        graph = self._build_fixture_graph()
+        all_edges = list(graph.edges)
+
+        trip_view_edges = [e for e in all_edges if "TripView" in e[0]]
+        dst_funcs = {e[3] for e in trip_view_edges}
+
+        assert "SlotCard" in dst_funcs or "Counter" in dst_funcs, (
+            f"No JSX component edges from TripView. "
+            f"TripView edges: {trip_view_edges}"
         )

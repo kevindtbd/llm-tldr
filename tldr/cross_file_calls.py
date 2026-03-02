@@ -57,6 +57,7 @@ _PARSER_CACHE: dict[str, "tree_sitter.Parser"] = {}
 # Some languages have non-standard function names (e.g., language_typescript)
 LANGUAGE_CONFIG: dict[str, tuple[str, str]] = {
     "typescript": ("tree_sitter_typescript", "language_typescript"),
+    "tsx": ("tree_sitter_typescript", "language_tsx"),
     "go": ("tree_sitter_go", "language"),
     "rust": ("tree_sitter_rust", "language"),
     "java": ("tree_sitter_java", "language"),
@@ -1544,7 +1545,12 @@ def _extract_ts_file_calls(
         Dict mapping caller function name to list of (call_type, call_target) tuples
         call_type is 'direct', 'attr', or 'intra'
     """
-    parser = get_parser("typescript")
+    # Use tsx parser for .tsx files (JSX support), typescript for .ts
+    lang = "tsx" if file_path.suffix == ".tsx" else "typescript"
+    parser = get_parser(lang)
+    if parser is None:
+        # Fallback to typescript parser if tsx not available
+        parser = get_parser("typescript")
     if parser is None:
         return {}
 
@@ -1618,6 +1624,21 @@ def _extract_ts_file_calls(
                             calls.append(("attr", f"{obj_name}.{method_name}"))
                         break
 
+            # Bug 6 fix: JSX component usage as call edges.
+            # <SlotCard /> = jsx_self_closing_element, <SlotCard>...</SlotCard> = jsx_opening_element
+            # PascalCase identifiers are user components (lowercase = HTML elements).
+            elif node.type in ("jsx_self_closing_element", "jsx_opening_element"):
+                for child in node.children:
+                    if child.type == "identifier":
+                        tag_name = source[child.start_byte : child.end_byte].decode("utf-8")
+                        # PascalCase = component, lowercase = HTML element
+                        if tag_name[0].isupper():
+                            if tag_name in defined_names:
+                                calls.append(("intra", tag_name))
+                            else:
+                                calls.append(("direct", tag_name))
+                        break
+
             for child in node.children:
                 visit_calls(child)
 
@@ -1669,6 +1690,21 @@ def _extract_ts_file_calls(
             process_functions(child)
 
     process_functions(tree.root_node)
+
+    # Bug 5 fix: capture module-level calls (e.g. describe/it in test files).
+    # Any call_expression at the top level that isn't inside a recognized function
+    # gets attributed to <module>.
+    module_calls = extract_calls_from_func(tree.root_node, "<module>")
+    if module_calls:
+        # Filter out calls already captured inside named functions
+        captured_calls = set()
+        for func_calls in calls_by_func.values():
+            for ct, target in func_calls:
+                captured_calls.add(target)
+        new_calls = [(ct, t) for ct, t in module_calls if t not in captured_calls]
+        if new_calls:
+            calls_by_func["<module>"] = new_calls
+
     return calls_by_func
 
 
