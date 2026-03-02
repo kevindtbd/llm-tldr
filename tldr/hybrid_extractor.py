@@ -656,6 +656,10 @@ class HybridExtractor:
                             module_info.call_graph,
                             defined_names,
                         )
+                    # Bug 2 fix: recurse into function body for nested declarations
+                    for body_child in child.children:
+                        if body_child.type == "statement_block":
+                            self._extract_ts_nodes(body_child, source, module_info, defined_names)
                 prev_comment = None
 
             # Classes
@@ -676,6 +680,10 @@ class HybridExtractor:
                 "variable_declarator",
                 "statement_block",
                 "export_clause",
+                # Bug 1: Object literal methods (e.g. NextAuth callbacks)
+                "object",
+                "pair",
+                "property",
             ):
                 self._extract_ts_nodes(child, source, module_info, defined_names)
                 prev_comment = None

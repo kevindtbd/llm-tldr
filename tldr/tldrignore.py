@@ -102,7 +102,18 @@ Thumbs.db
 
 
 def load_ignore_patterns(project_dir: str | Path) -> "PathSpec":
-    """Load ignore patterns from .tldrignore file.
+    """Load merged ignore patterns from ``.gitignore`` and ``.tldrignore``.
+
+    Pattern sources (merged in order, all additive):
+      1. ``.gitignore`` at the project root (if present)
+      2. ``.tldrignore`` at the project root, **or** sensible defaults
+
+    Note: ``scan_project()`` has a faster git-aware path that uses
+    ``git ls-files`` directly.  This function still merges ``.gitignore``
+    patterns because several other callers (``get_code_structure``,
+    ``scan_dir``, ``_iter_source_files``, semantic indexing) use
+    ``rglob`` + ``should_ignore`` and need ``.gitignore`` rules applied
+    via pattern matching.
 
     Args:
         project_dir: Root directory of the project
@@ -113,16 +124,22 @@ def load_ignore_patterns(project_dir: str | Path) -> "PathSpec":
     import pathspec
 
     project_path = Path(project_dir)
-    tldrignore_path = project_path / ".tldrignore"
-
     patterns: list[str] = []
 
+    # 1. Load .gitignore patterns (cheap — just reads the file, no subprocess)
+    gitignore_path = project_path / ".gitignore"
+    if gitignore_path.exists():
+        try:
+            patterns.extend(gitignore_path.read_text().splitlines())
+        except OSError:
+            pass
+
+    # 2. Layer on .tldrignore (or defaults)
+    tldrignore_path = project_path / ".tldrignore"
     if tldrignore_path.exists():
-        content = tldrignore_path.read_text()
-        patterns: list[str] = content.splitlines()
+        patterns.extend(tldrignore_path.read_text().splitlines())
     else:
-        # Use defaults if no .tldrignore exists
-        patterns = list(DEFAULT_TEMPLATE.splitlines())
+        patterns.extend(DEFAULT_TEMPLATE.splitlines())
 
     return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
 

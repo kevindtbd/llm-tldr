@@ -206,6 +206,43 @@ class ProjectCallGraph:
         return edge in self._edges
 
 
+def _get_git_known_files(root: str | Path) -> Optional[set[str]]:
+    """Return relative paths of files git knows about, or None if not a git repo.
+
+    Includes both tracked files (``--cached``) and untracked-but-not-ignored
+    files (``--others --exclude-standard``).  This means new files the user
+    is actively working on are included, while gitignored paths (build
+    artifacts, stale worktrees, node_modules, etc.) are excluded.
+
+    Files inside git submodules are *not* included — submodule entries appear
+    as mode-160000 directory placeholders and are filtered out by extension
+    matching in the caller.
+
+    Returns None when:
+      - ``root`` is not inside a git repository
+      - The ``git`` binary is not available
+      - The command times out (>5 s)
+    """
+    import subprocess
+
+    # .git can be a file (worktree) or directory (normal repo) — both are fine
+    git_dir = Path(root) / ".git"
+    if not git_dir.exists():
+        return None
+
+    try:
+        result = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(root),
+        )
+        if result.returncode != 0:
+            return None
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
 def scan_project(
     root: str | Path,
     language: str = "python",
@@ -215,6 +252,15 @@ def scan_project(
     """
     Find all source files in the project for the given language.
 
+    In a git repository (when ``respect_ignore=True``), only files known to
+    git (tracked + untracked-but-not-ignored) are considered.  This
+    automatically excludes stale worktrees, build artifacts, and any path
+    covered by ``.gitignore``, ``.git/info/exclude``, or the global
+    gitignore.  A ``.tldrignore`` file can further narrow the set.
+
+    Outside a git repo the function falls back to ``os.walk`` with
+    ``.tldrignore`` / default ignore patterns.
+
     Args:
         root: Project root directory
         language: One of the languages in SUPPORTED_LANGUAGES (python, typescript,
@@ -222,7 +268,7 @@ def scan_project(
                  ruby, swift, lua, elixir)
         workspace_config: Optional WorkspaceConfig for monorepo scoping.
                          If provided, filters files by activePackages and excludePatterns.
-        respect_ignore: If True, respect .tldrignore patterns (default True)
+        respect_ignore: If True, respect .gitignore and .tldrignore patterns (default True)
 
     Returns:
         List of absolute paths to source files
@@ -235,9 +281,6 @@ def scan_project(
     root_str = str(Path(root))  # Convert to str to ensure os.walk/relpath return str
     files: list[str] = []
 
-    # Load ignore patterns if respecting .tldrignore
-    ignore_spec = load_ignore_patterns(root_str) if respect_ignore else None
-
     # Look up extensions from single source of truth
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(
@@ -245,37 +288,52 @@ def scan_project(
             f"Supported: {sorted(SUPPORTED_LANGUAGES.keys())}"
         )
     extensions = SUPPORTED_LANGUAGES[language]
+    ext_tuple = tuple(extensions)
 
-    for dirpath, dirnames, filenames in os.walk(root_str):
-        # Skip ignored directories (modifying dirnames in-place prunes os.walk)
-        # Cast to str to satisfy type checker (os.walk/relpath return str for str input)
-        dirpath_str = str(dirpath)
-        if respect_ignore and ignore_spec:
-            rel_dir = str(os.path.relpath(dirpath_str, root_str))
-            # Check if current directory should be ignored
-            if rel_dir != "." and should_ignore(rel_dir + "/", root_str, ignore_spec):
-                dirnames.clear()  # Don't descend into ignored directories
-                continue
-            # Filter subdirectories
-            dirnames[:] = [
-                d
-                for d in dirnames
-                if not should_ignore(os.path.join(rel_dir, str(d)) + "/", root_str, ignore_spec)
-            ]
+    # --- Fast path: git-known files (tracked + untracked-but-not-ignored) ---
+    git_files: Optional[set[str]] = None
+    if respect_ignore:
+        git_files = _get_git_known_files(root_str)
 
-        for filename in filenames:
-            if filename.endswith(tuple(extensions)):
-                file_path = os.path.join(dirpath_str, str(filename))
-                # Check individual file against ignore patterns
-                if respect_ignore and ignore_spec:
-                    rel_path = str(os.path.relpath(file_path, root_str))
-                    if should_ignore(rel_path, root_str, ignore_spec):
-                        continue
-                files.append(file_path)
+    if git_files is not None:
+        # .tldrignore provides additional filtering on top of git
+        ignore_spec = load_ignore_patterns(root_str)
+
+        for rel_path in git_files:
+            if rel_path.endswith(ext_tuple):
+                if should_ignore(rel_path, root_str, ignore_spec):
+                    continue
+                abs_path = os.path.join(root_str, rel_path)
+                if os.path.isfile(abs_path):
+                    files.append(abs_path)
+    else:
+        # --- Fallback: os.walk with .tldrignore patterns ---
+        ignore_spec = load_ignore_patterns(root_str) if respect_ignore else None
+
+        for dirpath, dirnames, filenames in os.walk(root_str):
+            dirpath_str = str(dirpath)
+            if respect_ignore and ignore_spec:
+                rel_dir = str(os.path.relpath(dirpath_str, root_str))
+                if rel_dir != "." and should_ignore(rel_dir + "/", root_str, ignore_spec):
+                    dirnames.clear()
+                    continue
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not should_ignore(os.path.join(rel_dir, str(d)) + "/", root_str, ignore_spec)
+                ]
+
+            for filename in filenames:
+                if filename.endswith(ext_tuple):
+                    file_path = os.path.join(dirpath_str, str(filename))
+                    if respect_ignore and ignore_spec:
+                        rel_path = str(os.path.relpath(file_path, root_str))
+                        if should_ignore(rel_path, root_str, ignore_spec):
+                            continue
+                    files.append(file_path)
 
     # Apply workspace config filtering if provided
     if workspace_config is not None:
-        # Convert absolute paths to relative for filtering, then back to absolute
         rel_files = [os.path.relpath(f, root_str) for f in files]
         filtered_rel = filter_paths(rel_files, workspace_config)
         files = [os.path.join(root_str, f) for f in filtered_rel]
@@ -2330,13 +2388,38 @@ def _build_typescript_call_graph(
     file_list: Optional[list[str]] = None,
 ):
     """Build call graph for TypeScript files."""
-    # Initialize tsconfig resolver for path alias resolution
+    # Initialize tsconfig resolvers for path alias resolution.
+    # Bug 3 fix: find ALL tsconfig.json files with paths config (not just root).
+    # Monorepos have tsconfig.json in subdirs (e.g. apps/web/tsconfig.json).
+    tsconfig_resolvers: list = []  # list of (dir_path, TSConfigResolver)
     try:
         from tldr.tsconfig_resolver import TSConfigResolver
+        import glob as glob_mod
 
-        tsconfig_resolver = TSConfigResolver(str(root))
+        tsconfig_files = glob_mod.glob(str(root / "**/tsconfig.json"), recursive=True)
+        for tsconfig_path in tsconfig_files:
+            # Skip node_modules — their tsconfigs are irrelevant and often unparseable
+            if os.sep + "node_modules" + os.sep in tsconfig_path:
+                continue
+            ts_dir = str(Path(tsconfig_path).parent)
+            try:
+                resolver = TSConfigResolver(ts_dir)
+                if resolver.path_mappings:
+                    tsconfig_resolvers.append((ts_dir, resolver))
+            except Exception:
+                pass
+        # Sort by depth (deepest first) so nearest match wins
+        tsconfig_resolvers.sort(key=lambda x: x[0].count(os.sep), reverse=True)
     except Exception:
-        tsconfig_resolver = None
+        pass
+
+    def _get_resolver_for_file(file_path: str):
+        """Return the nearest TSConfigResolver for a source file."""
+        for dir_path, resolver in tsconfig_resolvers:
+            if file_path.startswith(dir_path):
+                return resolver
+        # Fallback: try any resolver that has mappings
+        return tsconfig_resolvers[0][1] if tsconfig_resolvers else None
 
     # Use provided file_list or scan project
     source_files = (
@@ -2365,10 +2448,11 @@ def _build_typescript_call_graph(
                 # Convert relative path to file path with index.ts resolution
                 module_path = _resolve_ts_import(rel_path, module, str(root))
             else:
-                # Try tsconfig path alias resolution
+                # Try tsconfig path alias resolution (per-file nearest tsconfig)
                 resolved = None
-                if tsconfig_resolver is not None:
-                    resolved = tsconfig_resolver.resolve(module)
+                file_resolver = _get_resolver_for_file(ts_file)
+                if file_resolver is not None:
+                    resolved = file_resolver.resolve(module)
                 if resolved:
                     try:
                         module_path = str(Path(resolved).relative_to(root))

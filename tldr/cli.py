@@ -606,9 +606,9 @@ Semantic Search:
     )
     warm_p.add_argument(
         "--lang",
-        default="python",
+        default="all",
         choices=["python", "typescript", "javascript", "go", "rust", "java", "c", "cpp", "all"],
-        help="Language (use 'all' for multi-language)",
+        help="Language (default: all)",
     )
 
     # tldr semantic index <path> / tldr semantic search <query>
